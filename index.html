@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>鏡頭數學賽車</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
+    font-family: "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif; color: #fff; }
+  #stage { position: fixed; inset: 0; }
+  /* 鏡頭畫面只拿來辨識，平常被賽車畫面蓋住（玩家自己的小畫面由賽車畫在左下角） */
+  #video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+  #race, #fx { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #fx { pointer-events: none; }
+  #ctl, #sys { position: absolute; left: 50%; transform: translateX(-50%); display: flex; gap: 6px; background: rgba(0,0,0,.6);
+    padding: 6px; border-radius: 999px; transition: opacity .4s; z-index: 5; white-space: nowrap; }
+  #ctl { top: 10px; }
+  #sys { top: 62px; }
+  #ctl.idle, #sys.idle { opacity: 0; pointer-events: none; }
+  #ctl div, #sys div { padding: 6px 16px; border-radius: 999px; font-size: 17px; font-weight: 700; cursor: pointer; user-select: none; }
+  #sys div { font-size: 15px; padding: 5px 14px; }
+  #ctl div:hover, #sys div:hover { background: rgba(255,255,255,.2); }
+  #sys div.on { background: #fff; color: #111; }
+  #msg { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 4vh;
+    font-weight: 700; text-align: center; padding: 0 8vw; background: rgba(0,0,0,.72); z-index: 8; }
+  #msg:empty { display: none; }
+  #help { position: absolute; top: 112px; right: 14px; max-width: 34em; font-size: 16px; line-height: 1.9; background: rgba(0,0,0,.78);
+    padding: 12px 18px; border-radius: 10px; display: none; z-index: 7; }
+  #help b { display: inline-block; min-width: 5.4em; color: #ffd54a; }
+  #help a { color: #9fd0ff; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="race"></canvas>
+  <canvas id="fx"></canvas>
+  <div id="ctl"></div>
+  <div id="sys"><div data-s="cam">切換鏡頭</div><div data-s="full">全螢幕</div><div data-s="test">鍵盤試玩</div><div data-s="help">說明</div></div>
+  <div id="help">
+    <b>怎麼玩</b>雙手像握方向盤一樣舉在胸前<br>
+    <b>轉彎</b>方向盤往左或往右傾斜<br>
+    <b>加速</b>方向盤拿高就快，放低就慢<br>
+    <b>答題</b>開過正確答案的閘門會衝刺，還會拿到道具<br>
+    <b>道具</b>雙手舉過頭就使用（衝刺、護盾、香蕉皮、提示）<br>
+    <b>開始</b>雙手舉過頭 0.7 秒，或按空白鍵<br>
+    <b>換車</b>還沒開始時，方向盤往左或往右打到底<br>
+    <hr style="border-color:rgba(255,255,255,.25)">
+    <b>C</b>切換鏡頭　<b>F</b>全螢幕　<b>H</b>說明<br>
+    <b>T</b>鍵盤試玩（不用鏡頭）：1P 用 ← → ↑ ↓，2P 用 J L I K，3P 用 A D W S，4P 用 4 6 8 5（左、右、加速、用道具）<br>
+    <hr style="border-color:rgba(255,255,255,.25)">
+    鏡頭畫面只在這台電腦上辨識，不會上傳。<br>
+    本程式以 AGPL-3.0 授權公開，<a id="src" href="https://github.com/iweilai0924/camera-kart-math" target="_blank" rel="noopener">原始碼在這裡</a>。
+  </div>
+  <div id="msg">載入辨識模型中…（第一次開會久一點）</div>
+</div>
+
+<script type="module">
+// 鏡頭數學賽車：這個檔案只負責「開鏡頭、辨識姿態、把結果交給賽車」；賽車本身在 race.js，姿態辨識在 pose-worker.js。
+import { createRace } from './race.js';
+
+const params = new URLSearchParams(location.search);
+const $ = id => document.getElementById(id);
+const video = $('video'), fx = $('fx'), fctx = fx.getContext('2d');
+
+// ───────── 可調整的設定 ─────────
+const CFG = {
+  inputSize: 640,         // 模型吃的影像大小
+  model: params.get('model') === 'n' ? 'n' : 's', // 有顯示卡加速時用的模型（s 比較準；網址加 ?model=n 改用較快的小模型）
+  detFps: 15,             // 每秒最多辨識幾次
+  maxPeople: 10,          // 最多同時偵測幾個人
+  minPerson: 0.35,        // 「這是一個人」的信心門檻
+  trackKeepMs: 800,       // 一個人暫時沒被偵測到，多久之內還算同一個人
+  camW: 1280, camH: 720,  // 向鏡頭要求的解析度
+  kpMinCutoff: 1.5, kpBeta: 6, // 關節平滑（One Euro 濾波）：靜止時的截止頻率、速度越快放得越鬆
+  raceSteerMax: 0.6,      // 兩手連線歪到幾弧度算方向盤打到底（0.6 約 35 度）
+  raceSteerDead: 0.07,    // 歪不到這個角度當作直走（約 4 度）
+  raceStepTh: 0.05,       // （踏步模式）左右膝蓋高度差超過「上半身長 × 這個值」才算抬腳
+  raceFullCadence: 2.6,   // （踏步模式）每秒踏幾步算油門踩到底
+  raceBoostMs: 2500,      // 答對後衝刺多久
+  raceTimeout: 150,       // 一局最多幾秒（一直沒跑完就結束）
+  raceGasTop: 0.2,        // （拿高模式）方向盤比肩膀低不到「肩寬 × 這個值」就是全速
+  raceGasBottom: 1.1,     // （拿高模式）方向盤比肩膀低超過「肩寬 × 這個值」（大約肚子的高度）就不加速
+  raceItemHoldMs: 250,    // 雙手舉過頭多久才算「使用道具」
+  raceCrashMs: 1500,      // 撞到路邊的東西或踩到香蕉皮後，暫停多久（毫秒）才能再開
+};
+const state = { test: params.has('test'), game: 'race', race: null, fps: 0, delegate: '', ready: false, cam: false };
+window.__state = state;
+const isPrime = n => { if (n < 2) return false; for (let i = 2; i * i <= n; i++) if (n % i === 0) return false; return true; };
+
+// ───────── 煙火（有人衝過終點時放）─────────
+let W = 0, H = 0;
+function resize() { W = fx.width = innerWidth; H = fx.height = innerHeight; }
+addEventListener('resize', resize); resize();
+const parts = [], rnd = (a, b) => a + Math.random() * (b - a);
+function launch(style) {
+  parts.push({ type: 'rocket', style, x: rnd(W * .12, W * .88), y: H, ty: rnd(H * .12, H * .5), vy: -H * rnd(1.0, 1.4), hue: style === 'gold' ? 46 : rnd(0, 360) });
+}
+function explode(x, y, style, hue) {
+  const k = H / 800;
+  if (style === 'gold') {
+    for (let i = 0; i < 150; i++) { // 金色垂柳：慢、久、會閃
+      const a = rnd(0, Math.PI * 2), s = rnd(40, 300) * k;
+      parts.push({ type: 'spark', x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 0, max: rnd(1.8, 2.8), hue: rnd(38, 54), light: rnd(60, 85), size: rnd(1.5, 3.2) * k, grav: 150 * k, drag: 1.6, flicker: true });
+    }
+    for (let i = 0; i < 40; i++) { // 外圈白環
+      const a = i / 40 * Math.PI * 2, s = 380 * k;
+      parts.push({ type: 'spark', x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 0, max: 1.1, hue: 50, light: 95, size: 2.2 * k, grav: 40 * k, drag: 2.2, flicker: false });
+    }
+  } else {
+    for (let i = 0; i < 100; i++) {
+      const a = rnd(0, Math.PI * 2), s = rnd(60, 360) * k;
+      parts.push({ type: 'spark', x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 0, max: rnd(1.0, 1.7), hue: hue + rnd(-18, 18), light: rnd(55, 75), size: rnd(1.5, 3) * k, grav: 130 * k, drag: 1.9, flicker: false });
+    }
+  }
+}
+function drawFireworks(dt) {
+  fctx.globalCompositeOperation = 'destination-out'; fctx.fillStyle = 'rgba(0,0,0,.22)'; fctx.fillRect(0, 0, W, H);
+  fctx.globalCompositeOperation = 'lighter';
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    if (p.type === 'rocket') {
+      p.y += p.vy * dt; fctx.fillStyle = `hsl(${p.hue} 100% 80%)`; fctx.fillRect(p.x - 2, p.y, 4, 14);
+      if (p.y <= p.ty) { explode(p.x, p.y, p.style, p.hue); parts.splice(i, 1); }
+      continue;
+    }
+    p.life += dt;
+    if (p.life >= p.max) { parts.splice(i, 1); continue; }
+    const r = p.life / p.max, d = Math.exp(-p.drag * dt);
+    let alpha = 1 - r * r;
+    p.vx *= d; p.vy = p.vy * d + p.grav * dt; p.x += p.vx * dt; p.y += p.vy * dt;
+    if (p.flicker && Math.random() < .25) alpha *= .3;
+    fctx.fillStyle = `hsl(${p.hue} 100% ${p.light}% / ${alpha})`;
+    fctx.beginPath(); fctx.arc(p.x, p.y, p.size, 0, Math.PI * 2); fctx.fill();
+  }
+}
+
+// ───────── 鏡頭 ─────────
+let cams = [], camIdx = 0;
+async function startCamera(deviceId) {
+  if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop());
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: { ideal: CFG.camW }, height: { ideal: CFG.camH }, ...(deviceId ? { deviceId: { exact: deviceId } } : {}) }, audio: false });
+  video.srcObject = stream; await video.play();
+  cams = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  const cur = stream.getVideoTracks()[0].getSettings().deviceId;
+  camIdx = Math.max(0, cams.findIndex(c => c.deviceId === cur));
+  state.cam = true;
+}
+async function nextCamera() {
+  if (cams.length < 2) { flash('只找到一個鏡頭'); return; }
+  try { await startCamera(cams[(camIdx + 1) % cams.length].deviceId); flash('鏡頭：' + (cams[camIdx].label || `第 ${camIdx + 1} 個`)); }
+  catch (err) { flash('切換鏡頭失敗：' + err.message); }
+}
+let flashTimer = 0;
+function flash(text) { // 短暫顯示一行訊息
+  $('msg').textContent = text; clearTimeout(flashTimer); flashTimer = setTimeout(() => { if ($('msg').textContent === text) $('msg').textContent = ''; }, 1600);
+}
+
+// ───────── 認出誰是誰、把關節抖動濾掉 ─────────
+// 每次辨識回來的人沒有編號，所以用位置對回上一次的同一個人，才能對他的每個關節做平滑（方向盤才不會抖）。
+class OneEuro {
+  constructor(minCutoff = 1, beta = 0, dCutoff = 1) { this.minCutoff = minCutoff; this.beta = beta; this.dCutoff = dCutoff; }
+  static alpha(cutoff, dt) { return 1 / (1 + 1 / (2 * Math.PI * cutoff) / dt); }
+  filter(x, t) {
+    if (this.t === undefined || t - this.t > 500) { this.t = t; this.x = x; this.dx = 0; return x; } // 太久沒更新就重來
+    const dt = Math.max((t - this.t) / 1000, 1e-3); this.t = t;
+    this.dx += OneEuro.alpha(this.dCutoff, dt) * ((x - this.x) / dt - this.dx);
+    this.x += OneEuro.alpha(this.minCutoff + this.beta * Math.abs(this.dx), dt) * (x - this.x);
+    return this.x;
+  }
+}
+let tracks = [], nextId = 1;
+function matchTracks(dets, now) {
+  const used = new Set();
+  for (const d of dets) {
+    let best = null, bd = Infinity;
+    for (const t of tracks) { if (used.has(t)) continue; const dd = Math.hypot(t.x - d.x, t.y - d.y); if (dd < bd) { bd = dd; best = t; } }
+    if (!best || bd > Math.max(d.w, best.w) * 0.7) { best = { id: nextId++ }; tracks.push(best); }
+    used.add(best); best.x = d.x; best.y = d.y; best.w = d.w; best.seen = now; d.track = best;
+  }
+  tracks = tracks.filter(t => now - t.seen < CFG.trackKeepMs);
+}
+function smoothKp(dets, now, h) { // 以畫面高為單位做濾波，這樣不同解析度的參數才一致
+  for (const d of dets) {
+    const tr = d.track;
+    if (!tr.kf) tr.kf = Array.from({ length: 34 }, () => new OneEuro(CFG.kpMinCutoff, CFG.kpBeta));
+    for (let k = 0; k < 17; k++) {
+      if (d.kp[k * 3 + 2] < 0.3) continue;
+      d.kp[k * 3] = tr.kf[k * 2].filter(d.kp[k * 3] / h, now) * h; d.kp[k * 3 + 1] = tr.kf[k * 2 + 1].filter(d.kp[k * 3 + 1] / h, now) * h;
+    }
+  }
+}
+
+// ───────── 姿態辨識（在背景執行緒 pose-worker.js 裡跑，畫面才不會被拖慢）─────────
+const PW = { w: null, ok: false, busy: false, last: 0, sent: 0, lastTime: -1 };
+let fpsCount = 0, fpsT0 = performance.now();
+function startDetector() {
+  return new Promise((resolve, reject) => {
+    PW.w = new Worker('./pose-worker.js');
+    PW.w.onerror = e => reject(new Error(e.message || '辨識程式載入失敗'));
+    PW.w.onmessage = e => {
+      const m = e.data;
+      if (m.type === 'ready') { PW.ok = true; state.delegate = m.delegate; resolve(); }
+      else if (m.type === 'error') reject(new Error(m.message));
+      else if (m.type === 'dets') {
+        PW.busy = false;
+        if (state.test) return;
+        const now = performance.now();
+        matchTracks(m.dets, now); smoothKp(m.dets, now, m.h); race.input(m.dets, m.w, m.h, now);
+        fpsCount++; if (now - fpsT0 > 1000) { state.fps = fpsCount; fpsCount = 0; fpsT0 = now; }
+      }
+    };
+    const url = name => new URL(`./models/yolov8${name}-pose.onnx`, location.href).href;
+    PW.w.postMessage({ type: 'init', base: new URL('./', location.href).href, model: url(CFG.model), modelCpu: url('n'), forceCpu: params.has('cpu'), size: CFG.inputSize, minPerson: CFG.minPerson });
+  });
+}
+async function detect() {
+  if (!PW.ok || state.test || !video.videoWidth) return;
+  const now = performance.now();
+  if (PW.busy && now - PW.sent < 3000) return; // 上一張還沒回來就不送下一張
+  if (now - PW.last < 1000 / CFG.detFps || video.currentTime === PW.lastTime) return;
+  PW.lastTime = video.currentTime; PW.busy = true; PW.last = PW.sent = now;
+  try {
+    const w = video.videoWidth, h = video.videoHeight, sc = Math.min(1, CFG.inputSize / Math.max(w, h)); // 先縮到模型需要的大小再傳過去
+    const bm = await createImageBitmap(video, { resizeWidth: Math.round(w * sc), resizeHeight: Math.round(h * sc), resizeQuality: 'low' });
+    PW.w.postMessage({ type: 'frame', bitmap: bm, w, h, max: CFG.maxPeople }, [bm]);
+  } catch (e) { PW.busy = false; }
+}
+
+// ───────── 賽車 ─────────
+const race = createRace({ CFG, state, $, launch, isPrime, params, getSource: () => video, srcSize: () => [video.videoWidth, video.videoHeight] });
+$('ctl').innerHTML = race.ctl();
+$('ctl').addEventListener('click', e => { const a = e.target.dataset.a; if (a && a.startsWith('race:')) { race.action(a.slice(5)); $('ctl').innerHTML = race.ctl(); } });
+
+let lastT = performance.now();
+function loop(t) {
+  requestAnimationFrame(loop);
+  const dt = Math.min((t - lastT) / 1000, 0.05); lastT = t;
+  detect(); race.tick(t, dt); drawFireworks(dt);
+}
+requestAnimationFrame(loop);
+
+// ───────── 按鈕與鍵盤（滑鼠 3.5 秒沒動，按鈕就淡出，不擋畫面）─────────
+function setTest(on) {
+  state.test = on; $('sys').querySelector('[data-s="test"]').classList.toggle('on', on);
+  if (on) $('msg').textContent = ''; else if (!state.cam) boot();
+}
+function toggleHelp() { const h = $('help'); h.style.display = h.style.display === 'block' ? 'none' : 'block'; }
+const toggleFull = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+$('sys').addEventListener('click', e => { const s = e.target.dataset.s; if (s === 'cam') nextCamera(); else if (s === 'full') toggleFull(); else if (s === 'test') setTest(!state.test); else if (s === 'help') toggleHelp(); });
+let idleTimer = 0;
+function wake() { for (const id of ['ctl', 'sys']) $(id).classList.remove('idle'); clearTimeout(idleTimer); idleTimer = setTimeout(() => { for (const id of ['ctl', 'sys']) $(id).classList.add('idle'); }, 3500); }
+addEventListener('mousemove', wake); addEventListener('mousedown', wake); wake();
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (race.key(k, true)) { e.preventDefault(); return; }
+  if (k === 't') setTest(!state.test); else if (k === 'c') nextCamera(); else if (k === 'f') toggleFull(); else if (k === 'h') toggleHelp();
+});
+addEventListener('keyup', e => race.key(e.key.toLowerCase(), false));
+
+// ───────── 啟動：開鏡頭 → 載入辨識模型 ─────────
+let booting = false;
+async function boot() {
+  if (booting) return; booting = true;
+  try {
+    $('msg').textContent = '請允許使用攝影機…';
+    await startCamera();
+    if (!PW.ok) { $('msg').textContent = '載入辨識模型中…（第一次開會久一點）'; await startDetector(); }
+    state.ready = true; $('msg').textContent = '';
+  } catch (err) {
+    console.error(err);
+    $('msg').textContent = err.name === 'NotAllowedError' ? '沒有鏡頭權限。請在網址列左側允許使用攝影機，再重新整理。（也可以按 T 用鍵盤試玩）'
+      : err.name === 'NotFoundError' ? '找不到鏡頭。接上鏡頭後重新整理，或按 T 用鍵盤試玩。' : '啟動失敗：' + err.message;
+  } finally { booting = false; }
+}
+if (state.test) setTest(true); else boot();
+</script>
+</body>
+</html>
